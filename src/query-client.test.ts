@@ -479,11 +479,12 @@ describe("queryLogEvents", () => {
 
   // Heal-budget deadline, retry rung: the unbounded retry/narrowing fan-out could run ~17 min per
   // sampled hour and outlast the caller's time limit, killing it before it can keep what it read.
-  // The deadline caps healing - checked before each backoff, so
-  // once the budget is gone the same-window retries stop and the sampled page is accepted as
-  // incomplete. Here the budget (3s) is crossed by the first 5s backoff, so the second retry that an
-  // unbounded run would make (cf. "gives up after the retry budget", whose ladder is [5000,10000]) is cut.
-  it("stops same-window retries when the heal budget runs out mid-backoff", async () => {
+  // The deadline caps healing - asked before each backoff of the moment the retry would be sent,
+  // so once the budget would be gone the same-window retries stop and the sampled page is accepted
+  // as incomplete. Here the first 5s retry lands at 5000, inside the 8000 budget, and the second
+  // would land at 15000, past it, so the second retry that an unbounded run would make (cf. "gives
+  // up after the retry budget", whose ladder is [5000,10000]) is never started.
+  it("stops same-window retries before a wait that would end past the heal deadline", async () => {
     const { fetchImpl, calls } = recordingFetch(() =>
       pageResponse(["id-a"], 100),
     ); // always sampled
@@ -493,7 +494,7 @@ describe("queryLogEvents", () => {
       configWith(fetchImpl, {
         sleep,
         now,
-        healDeadlineMs: 3000, // crossed once the first 5s backoff advances the clock to 5000
+        healDeadlineMs: 8000,
         narrowWidthsMs: [], // isolate the retry rung from narrowing
       }),
     );
@@ -502,6 +503,70 @@ describe("queryLogEvents", () => {
     expect(healBudgetExhausted).toBe(true); // the retry rung was cut short -> cause UNRESOLVED, not proven volume
     expect(calls).toHaveLength(2); // initial + 1 retry, then the deadline stops the 2nd retry
     expect(delays).toEqual([5000]); // only the first backoff; no second 10s sleep
+  });
+
+  // A retry whose wait began before the deadline but would end after it used to send its
+  // request past the deadline. Here the first wait would end at 5000, past the 3000 budget, so
+  // no wait starts and nothing more is sent.
+  it("starts no same-window retry whose request would go out past the deadline", async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      pageResponse(["id-a"], 100),
+    );
+    const { now, sleep, delays } = clockedSleep();
+
+    const { healBudgetExhausted } = await queryLogEventsTuned(
+      configWith(fetchImpl, {
+        sleep,
+        now,
+        healDeadlineMs: 3000,
+        narrowWidthsMs: [],
+      }),
+    );
+
+    expect(healBudgetExhausted).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(delays).toEqual([]);
+  });
+
+  // A timer can fire late. A wait that should have ended inside the budget but ended past it
+  // sends nothing: the deadline is asked again before the request, not only before the wait.
+  it("sends no same-window retry after a wait that overran the deadline", async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      pageResponse(["id-a"], 100),
+    );
+    const { now, sleep, delays } = clockedSleep(0, 2000); // every wait ends 2s late
+
+    const { healBudgetExhausted } = await queryLogEventsTuned(
+      configWith(fetchImpl, {
+        sleep,
+        now,
+        healDeadlineMs: 6000, // the 5s wait should end at 5000; it ends at 7000
+        narrowWidthsMs: [],
+      }),
+    );
+
+    expect(healBudgetExhausted).toBe(true);
+    expect(delays).toEqual([5000]);
+    expect(calls).toHaveLength(1);
+  });
+
+  // The first-call authentication retry is a retry like the others: with the deadline already
+  // spent it is not made, and the flake surfaces.
+  it("does not repeat the first-hit flake once the deadline is spent", async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      jsonResponse({
+        success: false,
+        errors: [{ code: 10000, message: "Authentication error" }],
+        result: null,
+      }),
+    );
+
+    await expect(
+      queryLogEventsTuned(
+        configWith(fetchImpl, { now: () => 1, healDeadlineMs: 0 }),
+      ),
+    ).rejects.toThrow();
+    expect(calls).toHaveLength(1);
   });
 
   // Heal-budget deadline, narrowing rung: the expensive rung is the fan-out into sub-windows. When
@@ -530,6 +595,75 @@ describe("queryLogEvents", () => {
     expect(events).toHaveLength(1); // the sampled wide-window's own events, kept
     expect(calls).toHaveLength(1); // NO sub-window fan-out (the fan-out would call again without the deadline)
     expect(timeframeOf(calls[0]!)).toEqual({ from: 0, to: 5999 });
+  });
+
+  // A fan-out the deadline interrupts used to give each of the remaining narrower windows its
+  // first read anyway. Each request here takes 1000 on the clock: the hour's read ends at 1000,
+  // the first narrower window's at 2000, the second's at 3000, past the 2500 deadline, so the
+  // third is never read. Its span would be missing from the narrower tiling, so the window keeps
+  // its own sampled read, which covers all of it, and the narrower reads are dropped.
+  it("stops a narrowing fan-out at the deadline and keeps the window's own read", async () => {
+    const clock = clockedSleep();
+    const sampled = widthAwareFetch(2000);
+    const fetchImpl: FetchLike = (input, init) => {
+      clock.advance(1000);
+      return sampled.fetchImpl(input, init);
+    };
+
+    const { events, maxAbrLevel, healBudgetExhausted } =
+      await queryLogEventsTuned(
+        configWith(fetchImpl, {
+          fromMs: 0,
+          toMs: 5999,
+          chunkMs: 6000,
+          narrowWidthsMs: [2000, 1000],
+          samplingRetries: 0,
+          now: clock.now,
+          healDeadlineMs: 2500,
+        }),
+      );
+
+    expect(sampled.calls.map(timeframeOf)).toEqual([
+      { from: 0, to: 5999 },
+      { from: 0, to: 1999 },
+      { from: 2000, to: 3999 },
+    ]);
+    expect(maxAbrLevel).toBe(100);
+    expect(healBudgetExhausted).toBe(true);
+    expect(events).toHaveLength(1); // the window's own sampled read, not a partial tiling
+  });
+
+  // The deadline is asked before every request of a narrower read, not only its first: a
+  // narrower window several pages long stops between pages, and the window keeps its own read.
+  it("stops a narrower window between its pages at the deadline", async () => {
+    const clock = clockedSleep();
+    const { fetchImpl: recorded, calls } = recordingFetch((_url, index) => {
+      if (index === 0) {
+        return pageResponse(["id-a"], 100); // the window's own read: short and sampled
+      }
+      return pageResponse(["id-b", "id-c"]); // a full page of the narrower window
+    });
+    const fetchImpl: FetchLike = (input, init) => {
+      clock.advance(1000);
+      return recorded(input, init);
+    };
+
+    const { events, healBudgetExhausted } = await queryLogEventsTuned(
+      configWith(fetchImpl, {
+        fromMs: 0,
+        toMs: 5999,
+        chunkMs: 6000,
+        narrowWidthsMs: [2000],
+        samplingRetries: 0,
+        now: clock.now,
+        healDeadlineMs: 1500, // inside it at the narrower window's first page, past it at its second
+      }),
+    );
+
+    expect(calls).toHaveLength(2);
+    expect(JSON.parse(calls[1]!.init?.body as string).offset).toBeUndefined();
+    expect(healBudgetExhausted).toBe(true);
+    expect(events).toHaveLength(1);
   });
 
   // The deadline bounds HEALING, never the base traversal - so a later chunk is never dropped just
@@ -728,10 +862,10 @@ describe("queryLogEvents", () => {
     expect(delays).toEqual([]); // no backoff
   });
 
-  // The transient retry shares the sampling heal budget: past healDeadlineMs it stops re-issuing and
-  // lets the failure surface, so a sustained outage fails inside the caller's time limit instead of
-  // sleeping past it. Here the deadline (3000) is crossed after the second backoff advances the
-  // clock, cutting the retries short of the full five.
+  // The transient retry shares the sampling heal budget: it starts no retry whose request would go
+  // out past healDeadlineMs and lets the failure surface, so a sustained outage fails inside the
+  // caller's time limit instead of sleeping past it. Here the first retry goes out at 2000, inside
+  // the 3000 budget, and the second would go out at 6000, so it is never started.
   it("stops transient retries once the heal budget is spent", async () => {
     const { fetchImpl, calls } = recordingFetch(
       () =>
@@ -748,8 +882,30 @@ describe("queryLogEvents", () => {
       ),
     ).rejects.toThrow(/logs query HTTP 500/);
 
-    expect(delays).toEqual([2000, 4000]); // the backoffs before the third, which the deadline stops
-    expect(calls).toHaveLength(3); // the fetch after the second backoff sees now() past the deadline
+    expect(delays).toEqual([2000]); // the second backoff would end past the deadline
+    expect(calls).toHaveLength(2);
+  });
+
+  // A late timer: the 2s wait should end inside the 2500 budget but ends at 3000, so the retry it
+  // was waiting for is not sent and the failure surfaces.
+  it("sends no transient retry after a wait that overran the deadline", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      () =>
+        new Response("down", {
+          status: 500,
+          statusText: "Internal Server Error",
+        }),
+    );
+    const { now, sleep, delays } = clockedSleep(0, 1000);
+
+    await expect(
+      queryLogEventsTuned(
+        configWith(fetchImpl, { now, sleep, healDeadlineMs: 2500 }),
+      ),
+    ).rejects.toThrow(/logs query HTTP 500/);
+
+    expect(delays).toEqual([2000]);
+    expect(calls).toHaveLength(1);
   });
 });
 

@@ -72,9 +72,15 @@ export function recordingSleep(): {
 // tests. now() reads the current value; sleep() records the delay AND advances the clock by it,
 // modeling the wall-clock progression a real read sees as backoff burns time - so a test can place
 // healDeadlineMs where the clock crosses it after a known number of backoffs, with no real timer.
-export function clockedSleep(startMs = 0): {
+// `lateByMs` makes every sleep end that much later than asked, as a real timer can; advance()
+// moves the clock for time spent elsewhere, such as in a request.
+export function clockedSleep(
+  startMs = 0,
+  lateByMs = 0,
+): {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
+  advance: (ms: number) => void;
   delays: number[];
 } {
   let t = startMs;
@@ -83,8 +89,11 @@ export function clockedSleep(startMs = 0): {
     now: () => t,
     sleep: (ms: number) => {
       delays.push(ms);
-      t += ms;
+      t += ms + lateByMs;
       return Promise.resolve();
+    },
+    advance: (ms: number) => {
+      t += ms;
     },
     delays,
   };
