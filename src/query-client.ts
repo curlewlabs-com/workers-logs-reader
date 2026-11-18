@@ -50,10 +50,13 @@
 // its own time limit). Without it the worst case is unbounded: a day sampled in many hours
 // would fan retry + narrowing out to ~17 min PER sampled hour (15s of hour retries + 6x + 60x
 // sub-window retries), so a few sampled hours would outlast any job timeout and the caller
-// would be killed before it could keep what it had read and report it. So once now() reaches
-// healDeadlineMs the heal rungs stop and the read accepts what it has as incomplete. The base
+// would be killed before it could keep what it had read and report it. So no heal request goes
+// out at or past healDeadlineMs: a retry whose wait would end past it is not started, a wait that
+// overran it sends nothing, and a narrowing fan-out the deadline interrupts is abandoned, the
+// window keeping its own sampled read. The read then accepts what it has as incomplete. The base
 // per-chunk traversal (one paginated pass) is NEVER time-boxed, so the deadline only drops heal
-// *attempts*, never events.
+// *attempts*, never a span's only read; what can still run past it is that one pass over each
+// chunk not yet read.
 // Only sampling the heal leaves unresolved - surviving the 1-minute floor, or still present when
 // the heal budget is spent - reaches the caller as abr_level > 1. Those are NOT the same signal,
 // so the result carries a `healBudgetExhausted` flag that distinguishes them: floor-survived
@@ -70,9 +73,10 @@
 // exponential backoff before it is allowed to fail the read (fetchPage / isTransientQueryError).
 // The query is idempotent under the keyset cursor, so a re-issue cannot miss/dup. A non-transient
 // HTTP status (any 4xx but 429) or an envelope success=false / shape error is NOT retried here -
-// those are definitive server verdicts that must surface at once. These retries are bounded by
-// healDeadlineMs too, so a sustained control-plane outage still fails inside the caller's time
-// limit instead of sleeping past it.
+// those are definitive server verdicts that must surface at once. These retries, and the one
+// first-hit-flake retry, are bounded by healDeadlineMs too, the same way as the heal requests, so a
+// sustained control-plane outage still fails inside the caller's time limit instead of sleeping
+// past it.
 //
 // `fetchImpl`, `sleep`, and a `now` clock are injected so the polling loop AND the
 // heal-budget deadline are unit-testable without the network, real delays, or a real clock.
@@ -103,13 +107,13 @@ export interface LogsQueryConfig {
   fetchImpl: FetchLike;
   sleep: (ms: number) => Promise<void>;
   // Injected monotonic clock + wall-clock deadline that BOUND the adaptive-sampling heal work
-  // (same-window retry backoff + narrowing fan-out - see pastHealDeadline and the file header).
-  // Once now() >= healDeadlineMs the heal rungs stop and the sampled data is accepted as
-  // incomplete; the base per-chunk traversal (one paginated pass) is never cut off, so bounding
-  // the heal drops heal attempts, never events. Required, like fetchImpl and sleep, so a
-  // forgotten deadline is a compile error rather than a silent unbounded run. Set it under
-  // whatever time limit the caller runs within; tests pass an Infinity deadline for unbounded
-  // healing.
+  // (same-window retry backoff + narrowing fan-out) and every retry - see pastHealDeadline and
+  // the file header. No heal or retry request is sent at or past healDeadlineMs, and the sampled
+  // data is accepted as incomplete; the base per-chunk traversal (one paginated pass) is never
+  // cut off, so bounding the heal drops heal attempts, never events. Required, like fetchImpl
+  // and sleep, so a forgotten deadline is a compile error rather than a silent unbounded run.
+  // Set it under whatever time limit the caller runs within, with room for one pass over the
+  // chunks not yet read; tests pass an Infinity deadline for unbounded healing.
   now: () => number;
   healDeadlineMs: number;
   // Free-text substring the API matches over the whole event, narrowing the result
@@ -249,14 +253,15 @@ class LogsQueryTransportError extends Error {
 }
 
 // True once the run has spent its wall-clock budget for HEALING adaptive sampling (retry
-// backoff + narrowing fan-out). Past it the heal rungs stop and the sampled data is accepted
-// as incomplete, so the caller still gets the read back inside its own time limit instead of
-// being killed mid-fan-out. Only bounds heal attempts - the
+// backoff + narrowing fan-out), or will have spent it `afterMs` from now - the end of a wait a
+// retry is about to start. Every heal or retry request asks first, so none goes out past the
+// deadline: the sampled data is accepted as incomplete, and the caller still gets the read back
+// inside its own time limit instead of being killed mid-fan-out. Only bounds heal attempts - the
 // base per-chunk traversal is never gated on it, so no events are dropped. now/healDeadlineMs
 // are required (see LogsQueryConfig), so there is no half-configured or time-blind state; tests
 // pass an Infinity deadline for unbounded healing.
-function pastHealDeadline(config: TunedConfig): boolean {
-  return config.now() >= config.healDeadlineMs;
+function pastHealDeadline(config: TunedConfig, afterMs = 0): boolean {
+  return config.now() + afterMs >= config.healDeadlineMs;
 }
 
 export interface LogsQueryResult {
@@ -398,7 +403,7 @@ export async function queryLogEventsTuned(
 // the window still comes back downsampled (maxAbrLevel > 1) and a narrower width is left in
 // `narrowWidths`, the window is RE-QUERIED tiled at that next width (the sampled attempt's
 // events are discarded - adjacent positive-width sub-windows replace them, the last reaching
-// toMs as windowEnd says), recursing per sub-window. A window that
+// toMs as windowEnd says), recursing per sub-window (narrowSampledWindow). A window that
 // reaches full resolution (or ABR_LEVEL_UNKNOWN, which is <= 1 and never narrows - a drifted
 // shape will not heal by narrowing) or runs out of widths returns as-is; a still-sampled return
 // at the 1-min floor is the incomplete read the caller fails on. `applyFirstHitRetry` rides
@@ -411,7 +416,27 @@ async function queryWindowNarrowing(
   applyFirstHitRetry: boolean,
   narrowWidths: number[],
 ): Promise<LogsQueryResult> {
-  const result = await queryWindow(config, fromMs, toMs, applyFirstHitRetry);
+  const result = await queryWindow(
+    config,
+    fromMs,
+    toMs,
+    applyFirstHitRetry,
+    false,
+  );
+  return narrowSampledWindow(config, fromMs, toMs, result, narrowWidths);
+}
+
+// The narrowing rung of queryWindowNarrowing, given the window's own read `result`. Each
+// sub-window is read as a heal read, which the deadline stops before any of its requests; one
+// that is stopped leaves the tiling incomplete, so the window falls back to `result`, which
+// covers all of it, and the sub-windows already read are dropped with the rest of the attempt.
+async function narrowSampledWindow(
+  config: TunedConfig,
+  fromMs: number,
+  toMs: number,
+  result: LogsQueryResult,
+  narrowWidths: number[],
+): Promise<LogsQueryResult> {
   const [width, ...rest] = narrowWidths;
   // No narrowing when the window is already full resolution (maxAbrLevel <= 1 - which also
   // covers ABR_LEVEL_UNKNOWN at -1, the drifted-shape case that fails closed without narrowing)
@@ -450,7 +475,22 @@ async function queryWindowNarrowing(
   let healBudgetExhausted = false;
   for (let subFrom = fromMs; subFrom < toMs; subFrom += width) {
     const subTo = windowEnd(subFrom, width, toMs);
-    const sub = await queryWindowNarrowing(config, subFrom, subTo, false, rest);
+    const subRead = await queryWindow(config, subFrom, subTo, false, true);
+    if (subRead === undefined) {
+      console.warn(
+        `[workers-logs-reader] heal-budget deadline reached while narrowing window ` +
+          `[${fromMs}..${toMs}] (abr_level=${result.maxAbrLevel}) - keeping its sampled read ` +
+          `instead of the narrower windows; the read will report itself incomplete (cause unresolved)`,
+      );
+      return { ...result, healBudgetExhausted: true };
+    }
+    const sub = await narrowSampledWindow(
+      config,
+      subFrom,
+      subTo,
+      subRead,
+      rest,
+    );
     appendAll(events, sub.events);
     maxAbrLevel = worseAbrLevel(maxAbrLevel, sub.maxAbrLevel);
     healBudgetExhausted = healBudgetExhausted || sub.healBudgetExhausted;
@@ -460,13 +500,30 @@ async function queryWindowNarrowing(
 
 // Page one [fromMs, toMs] chunk to exhaustion, returning its events and the highest
 // abr_level any of its pages reported. `applyFirstHitRetry` gates the one-time
-// control-plane-flake retry to the run's very first request.
+// control-plane-flake retry to the run's very first request. A heal read (`healRead`), a
+// narrower re-read of a span another read already covered, asks the deadline before each page
+// and returns undefined instead of sending one past it; a window's own read never stops.
+function queryWindow(
+  config: TunedConfig,
+  fromMs: number,
+  toMs: number,
+  applyFirstHitRetry: boolean,
+  healRead: false,
+): Promise<LogsQueryResult>;
+function queryWindow(
+  config: TunedConfig,
+  fromMs: number,
+  toMs: number,
+  applyFirstHitRetry: boolean,
+  healRead: true,
+): Promise<LogsQueryResult | undefined>;
 async function queryWindow(
   config: TunedConfig,
   fromMs: number,
   toMs: number,
   applyFirstHitRetry: boolean,
-): Promise<LogsQueryResult> {
+  healRead: boolean,
+): Promise<LogsQueryResult | undefined> {
   const pageLimit = config.pageLimit ?? DEFAULT_PAGE_LIMIT;
   const maxPages = config.maxPages ?? DEFAULT_MAX_PAGES;
 
@@ -476,6 +533,9 @@ async function queryWindow(
   let cursor: string | undefined;
 
   for (let page = 0; page < maxPages; page++) {
+    if (healRead && pastHealDeadline(config)) {
+      return undefined;
+    }
     const fetched = await fetchPageResolvingSampling(
       config,
       fromMs,
@@ -555,24 +615,30 @@ async function fetchPageResolvingSampling(
   const backoffMs = config.samplingBackoffMs ?? DEFAULT_SAMPLING_BACKOFF_MS;
   let healBudgetExhausted = false;
   for (let attempt = 1; attempt <= retries && parsed.abrLevel > 1; attempt++) {
+    const delayMs = backoffMs * 2 ** (attempt - 1);
     // Stop spending backoff once the heal budget is gone - the page has already been fetched, so
     // its (sampled) events are in hand; accept them as incomplete rather than sleep past the
-    // caller's time limit. Checked before the sleep so no new backoff starts past the deadline.
-    if (pastHealDeadline(config)) {
+    // caller's time limit. Asked before the wait, of the moment the retry's request would go out,
+    // so no wait starts that ends past the deadline; asked again after it, since a timer can fire
+    // late.
+    if (pastHealDeadline(config, delayMs)) {
+      healBudgetExhausted = true;
+    } else {
+      console.warn(
+        `[workers-logs-reader] query adaptively sampled (abr_level=${parsed.abrLevel}) on window ` +
+          `[${fromMs}..${toMs}] - retry ${attempt}/${retries} after ${delayMs}ms backoff`,
+      );
+      await config.sleep(delayMs);
+      healBudgetExhausted = pastHealDeadline(config);
+    }
+    if (healBudgetExhausted) {
       console.warn(
         `[workers-logs-reader] heal-budget deadline reached on window [${fromMs}..${toMs}] ` +
           `(abr_level=${parsed.abrLevel}) - accepting the sampled page without further ` +
           `same-window retries (cause unresolved)`,
       );
-      healBudgetExhausted = true;
       break;
     }
-    const delayMs = backoffMs * 2 ** (attempt - 1);
-    console.warn(
-      `[workers-logs-reader] query adaptively sampled (abr_level=${parsed.abrLevel}) on window ` +
-        `[${fromMs}..${toMs}] - retry ${attempt}/${retries} after ${delayMs}ms backoff`,
-    );
-    await config.sleep(delayMs);
     parsed = await fetchPage(config, fromMs, toMs, pageLimit, cursor);
   }
   // Same-window retries are spent and the page is still sampled. This rung cannot see whether the
@@ -603,7 +669,7 @@ async function fetchPageWithFirstHitRetry(
   try {
     return await fetchPage(config, fromMs, toMs, pageLimit, cursor);
   } catch (err) {
-    if (!isCloudflareFirstHitFlake(err)) {
+    if (!isCloudflareFirstHitFlake(err) || pastHealDeadline(config)) {
       throw err;
     }
     console.warn(
@@ -661,10 +727,11 @@ function isTransientQueryError(err: unknown): boolean {
 // with exponential backoff - the lowest retry rung, below fetchPageResolvingSampling's abr_level
 // retry. Bounded by transientRetries AND healDeadlineMs: past either, the last error is rethrown so
 // the run fails (a failed fetch, unlike a sampled page, leaves no page result to keep; the outer
-// traversal can still preserve completed chunks). The deadline is checked before the backoff sleep
-// so no new backoff starts past it. Every page fetch in the run flows through here - page 0 (under
-// the first-hit wrapper), sampling re-fetches, and narrowing sub-windows alike - so the whole
-// fan-out inherits transient resilience uniformly.
+// traversal can still preserve completed chunks). The deadline is asked before the backoff sleep,
+// of the moment the retry would be sent, so no backoff starts that ends past it, and again after
+// the sleep, so a late timer sends nothing past it either. Every page fetch in the run flows
+// through here - page 0 (under the first-hit wrapper), sampling re-fetches, and narrowing
+// sub-windows alike - so the whole fan-out inherits transient resilience uniformly.
 async function fetchPage(
   config: TunedConfig,
   fromMs: number,
@@ -678,19 +745,22 @@ async function fetchPage(
     try {
       return await fetchPageOnce(config, fromMs, toMs, pageLimit, cursor);
     } catch (err) {
+      const delayMs = backoffMs * 2 ** attempt;
       if (
         !isTransientQueryError(err) ||
         attempt >= retries ||
-        pastHealDeadline(config)
+        pastHealDeadline(config, delayMs)
       ) {
         throw err;
       }
-      const delayMs = backoffMs * 2 ** attempt;
       console.warn(
         `[workers-logs-reader] query transient failure on window [${fromMs}..${toMs}] - ` +
           `retry ${attempt + 1}/${retries} after ${delayMs}ms backoff: ${failureClass(err)}`,
       );
       await config.sleep(delayMs);
+      if (pastHealDeadline(config)) {
+        throw err;
+      }
     }
   }
 }

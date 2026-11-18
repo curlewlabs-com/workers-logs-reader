@@ -67,7 +67,7 @@ ships TypeScript source, so it needs a runtime or bundler that compiles
 TypeScript, such as Bun:
 
 ```sh
-bun add https://github.com/curlewlabs-com/workers-logs-reader/releases/download/v0.1.0/curlewlabs-com-workers-logs-reader-0.1.0.tgz
+bun add https://github.com/curlewlabs-com/workers-logs-reader/releases/download/v0.1.1/curlewlabs-com-workers-logs-reader-0.1.1.tgz
 ```
 
 The lockfile records the tarball's integrity, and each release is immutable.
@@ -120,7 +120,7 @@ accepted permission for the endpoint. The token goes only to
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `accountId`, `apiToken` | Every call names the account and carries a token.                                                                                                                                                                                                                                                                                                                |
 | `fetchImpl`, `sleep`    | The package makes no call and waits on no timer of its own: it runs wherever you can hand it a `fetch`, and tests run without the network.                                                                                                                                                                                                                       |
-| `now`, `healDeadlineMs` | Healing a heavily sampled day can take many minutes. Past the deadline the read stops healing and returns what it has, marked incomplete; every chunk still gets its one pass, so no events are dropped for time. Set it inside whatever time limit you run within.                                                                                              |
+| `now`, `healDeadlineMs` | Healing a heavily sampled day can take many minutes. No healing or retry request goes out at or past the deadline; the read returns what it has, marked incomplete. Every chunk still gets its one pass, so no events are dropped for time: set it inside your own time limit, with room for that pass over the chunks not yet read.                             |
 | `needle` (optional)     | The API's own full-text match, for one request's or one identity's events out of a short window. Unset, every event is read.                                                                                                                                                                                                                                     |
 | `dataset` (optional)    | The dataset to read: the Workers log events by default, or another the API holds, such as trace spans.                                                                                                                                                                                                                                                           |
 | `onPage` (optional)     | For a caller that only folds the events, summing sizes or counting: each page goes to the callback and is not kept. The read is then a single pass, one request per page with no retry of a sampled page and no narrowing, so it costs one read of the window; `maxAbrLevel` still says whether any page was sampled, and a sampled read is reported unresolved. |
@@ -160,6 +160,12 @@ seconds; any other status, or an answer with `success: false`, fails at once.
 The first request of a read is also repeated once on the control plane's
 first-call authentication flake.
 
+The deadline is asked before every one of those requests. A retry whose wait
+would end past it is not started, a wait that ends past it anyway sends nothing,
+and a window whose narrowing it interrupts, a chunk or a 10-minute piece of one,
+keeps its own sampled read, which covers all of it, in place of the narrower
+windows read so far.
+
 The source files say why each step is what it is: `src/query-client.ts` for the
 read, `src/abr.ts` for the sampling verdict.
 
@@ -167,16 +173,6 @@ read, `src/abr.ts` for the sampling verdict.
 
 - A runtime with `fetch` that compiles TypeScript, or a bundler in front of one.
   The tests run on Bun.
-
-## Known issues
-
-- **The heal deadline is checked before each wait, not before each request.** A
-  retry whose wait began before the deadline still sends its request after it,
-  the first-call authentication retry does not look at the deadline, and once a
-  chunk starts narrowing, each of its narrower windows still gets its first read
-  after the deadline passes. A read can therefore run past `healDeadlineMs` by
-  one retry's request, or by the rest of one chunk's narrower reads; leave that
-  much room under your own limit.
 
 ## License
 

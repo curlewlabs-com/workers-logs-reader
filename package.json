@@ -1,6 +1,6 @@
 {
   "name": "@curlewlabs-com/workers-logs-reader",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Read a Cloudflare Workers Observability window to exhaustion from the telemetry query API, and know whether what came back is complete.",
   "license": "MIT OR Apache-2.0",
   "repository": {
