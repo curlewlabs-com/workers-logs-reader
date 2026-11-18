@@ -34,8 +34,11 @@ the Paid plan and `logpush = true` on each Worker, and it starts from when you
 turn it on. If that fits, use it.
 
 Reading the events back through the telemetry query API instead needs nothing
-enabled on the Workers and can reach any day still inside the retention window.
-But a naive read is quietly incomplete:
+beyond Workers Logs itself: the `observability` setting each Worker must have
+for its logs to be stored at all, which newly created Workers have on by default
+([enable Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs)).
+It can reach any day still inside the retention window. But a naive read is
+quietly incomplete:
 
 - **The API samples by query cost.** A query over a whole day is answered from a
   downsampled copy: one was seen at `result.statistics.abr_level` 10, about one
@@ -48,9 +51,12 @@ But a naive read is quietly incomplete:
 
 This package reads in hours, re-reads what came back sampled, narrows what stays
 sampled, and reports the sampling level it ends with, so a caller can refuse to
-call a sampled read complete. It reads `abr_level` as the API returns it, and
-treats a page without a positive `abr_level` as incomplete rather than as full
-resolution.
+call a sampled read complete. "Complete" here means every event Workers Logs
+stored for the window: a Worker without the `observability` setting, one whose
+`head_sampling_rate` is below 1, or an account past Workers Logs' daily limit,
+after which it samples at 1%, stored fewer events than ran, and no read of the
+store can tell. It reads `abr_level` as the API returns it, and treats a page
+without a positive `abr_level` as incomplete rather than as full resolution.
 
 ## How to use it
 
