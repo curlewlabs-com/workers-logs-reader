@@ -65,7 +65,7 @@
 // the heal budget).
 //
 // Beneath EVERY rung sits a transport-level retry the sampling ladder never sees: a page fetch that
-// fails outright - HTTP 429/500/502/503/504 (a transient control-plane blip) or a transport error
+// fails outright - HTTP 429 or any 5xx (a transient control-plane blip) or a transport error
 // (the fetch rejected, or the body was unreadable/undecodable) - is re-issued a few times with
 // exponential backoff before it is allowed to fail the read (fetchPage / isTransientQueryError).
 // The query is idempotent under the keyset cursor, so a re-issue cannot miss/dup. A non-transient
@@ -92,10 +92,9 @@ export interface LogsQueryConfig {
   accountId: string;
   // Needs Workers Observability Read on the account.
   apiToken: string;
-  // Event window cutoff, in epoch ms. fromMs is inclusive; toMs is included when a
-  // positive-width final chunk reaches it. If toMs is exactly the next chunk boundary,
-  // the traversal stops at the preceding millisecond because Cloudflare rejects the
-  // point-width [toMs, toMs] query.
+  // The window, in epoch ms, both ends inclusive; fromMs must be before toMs. When
+  // toMs falls one millisecond past a chunk boundary, the chunk before reaches it
+  // (windowEnd), since Cloudflare rejects a point-width [toMs, toMs] query.
   fromMs: number;
   toMs: number;
   // Injected. Never defaulted here so a forgotten injection in a test fails loudly
@@ -154,7 +153,7 @@ export interface QueryTuning {
   samplingRetries?: number;
   samplingBackoffMs?: number;
   // Transient-failure retry (see DEFAULT_TRANSIENT_RETRIES / DEFAULT_TRANSIENT_BACKOFF_MS and
-  // fetchPage). A page fetch that fails with a transient control-plane blip - HTTP 429/500/502/503/504
+  // fetchPage). A page fetch that fails with a transient control-plane blip - HTTP 429 or any 5xx
   // or a transport error (the fetch rejected, or the body was unreadable) - is re-issued up to
   // transientRetries times with exponential backoff (transientBackoffMs, x2, ...). Idempotent under
   // the keyset cursor, so a re-issue cannot miss/dup. A non-transient 4xx or an envelope/shape error
@@ -217,11 +216,13 @@ const DEFAULT_TRANSIENT_RETRIES = 5;
 const DEFAULT_TRANSIENT_BACKOFF_MS = 2000;
 
 // HTTP statuses that are transient control-plane blips on this idempotent query, worth re-issuing:
-// 429 (rate-limited) and the 5xx family Cloudflare returns during a wobble. Every OTHER non-2xx -
-// 400/401/403/404 etc. - is a definitive verdict (bad token, missing scope, wrong URL) that a retry
-// cannot fix and must surface at once, so it is intentionally absent. 401 in particular is left to
-// the first-hit-flake retry (isCloudflareFirstHitFlake), which owns the run's opening auth wobble.
-const TRANSIENT_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
+// 429 (rate-limited) and every 5xx, Cloudflare's own 52x edge errors included. Every OTHER
+// non-2xx - 400/401/403/404 etc. - is a definitive verdict (bad token, missing scope, wrong URL)
+// that a retry cannot fix and must surface at once. 401 in particular is left to the
+// first-hit-flake retry (isCloudflareFirstHitFlake), which owns the run's opening auth wobble.
+function isTransientStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
 
 // A non-OK HTTP response, carrying the numeric status so the transient-retry layer can classify it
 // without re-parsing the thrown message. The message keeps the same `logs query HTTP <status>` shape
@@ -329,6 +330,17 @@ export async function queryLogEvents(
 export async function queryLogEventsTuned(
   config: TunedConfig,
 ): Promise<LogsQueryResult> {
+  // An empty, reversed or non-numeric window would send no request and come back
+  // as a complete read of nothing.
+  if (
+    !Number.isFinite(config.fromMs) ||
+    !Number.isFinite(config.toMs) ||
+    config.fromMs >= config.toMs
+  ) {
+    throw new Error(
+      `logs query window must have fromMs before toMs, got [${config.fromMs}..${config.toMs}]`,
+    );
+  }
   const chunkMs = config.chunkMs ?? DEFAULT_CHUNK_MS;
   const narrowWidths = config.narrowWidthsMs ?? DEFAULT_NARROW_WIDTHS_MS;
   if (config.onPage !== undefined && narrowWidths.length > 0) {
@@ -385,8 +397,8 @@ export async function queryLogEventsTuned(
 // sampling persists. queryWindow paginates the window with its per-page same-window retry; if
 // the window still comes back downsampled (maxAbrLevel > 1) and a narrower width is left in
 // `narrowWidths`, the window is RE-QUERIED tiled at that next width (the sampled attempt's
-// events are discarded - adjacent positive-width sub-windows replace them, subject to the same
-// exact-boundary cutoff documented by LogsQueryConfig), recursing per sub-window. A window that
+// events are discarded - adjacent positive-width sub-windows replace them, the last reaching
+// toMs as windowEnd says), recursing per sub-window. A window that
 // reaches full resolution (or ABR_LEVEL_UNKNOWN, which is <= 1 and never narrows - a drifted
 // shape will not heal by narrowing) or runs out of widths returns as-is; a still-sampled return
 // at the 1-min floor is the incomplete read the caller fails on. `applyFirstHitRetry` rides
@@ -640,7 +652,7 @@ function isTransientQueryError(err: unknown): boolean {
     return true;
   }
   if (err instanceof LogsQueryHttpError) {
-    return TRANSIENT_HTTP_STATUSES.has(err.status);
+    return isTransientStatus(err.status);
   }
   return false;
 }

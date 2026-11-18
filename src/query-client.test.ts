@@ -873,3 +873,43 @@ describe("queryLogEvents at scale and in its logs", () => {
     }
   });
 });
+
+describe("queryLogEvents window", () => {
+  // Each of these would send no request and come back as a complete read of
+  // nothing, which samplingFailure would then call complete.
+  it.each([
+    { fromMs: 2000, toMs: 2000 },
+    { fromMs: 3000, toMs: 2000 },
+    { fromMs: Number.NaN, toMs: 2000 },
+    { fromMs: 0, toMs: Number.POSITIVE_INFINITY },
+  ])("refuses the window [$fromMs..$toMs]", async ({ fromMs, toMs }) => {
+    const { fetchImpl, calls } = recordingFetch(() => pageResponse([]));
+    await expect(
+      queryLogEvents({
+        accountId: "acct-id",
+        apiToken: "tok-redacted",
+        fromMs,
+        toMs,
+        fetchImpl,
+        sleep: () => Promise.resolve(),
+        now: () => 0,
+        healDeadlineMs: Number.POSITIVE_INFINITY,
+      }),
+    ).rejects.toThrow(/fromMs before toMs/);
+    expect(calls).toHaveLength(0);
+  });
+
+  // Cloudflare's own edge errors (520-527) are a wobble like a 502, not a verdict.
+  it("retries a 52x edge error like any other 5xx", async () => {
+    const { fetchImpl, calls } = recordingFetch((_url, index) =>
+      index === 0
+        ? new Response("edge", { status: 522 })
+        : pageResponse(["id-a"]),
+    );
+    const { events } = await queryLogEventsTuned(
+      configWith(fetchImpl, { transientBackoffMs: 1 }),
+    );
+    expect(events).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  });
+});

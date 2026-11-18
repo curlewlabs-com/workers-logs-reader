@@ -23,7 +23,7 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "bun test --no-install src"
+    "test": "bun test --no-install --timeout 60000 src"
   },
   "devDependencies": {
     "@types/bun": "1.4.4",

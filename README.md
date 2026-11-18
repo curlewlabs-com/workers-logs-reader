@@ -148,10 +148,10 @@ when each page was read; `utcDayWindow` marks such a window `sealed: false`.
 
 A sampled page is re-read twice, after 5 and 10 seconds. A chunk still sampled
 after that is re-read as six 10-minute windows, and any of those still sampled
-as ten 1-minute windows. A failed request (429, 500, 502, 503, 504, no response,
-or a body that could not be read) is re-read up to five times, after 2, 4, 8, 16
-and 32 seconds; any other status, or an answer with `success: false`, fails at
-once. The first request of a read is also repeated once on the control plane's
+as ten 1-minute windows. A failed request (429, any 5xx, no response, or a body
+that could not be read) is re-read up to five times, after 2, 4, 8, 16 and 32
+seconds; any other status, or an answer with `success: false`, fails at once.
+The first request of a read is also repeated once on the control plane's
 first-call authentication flake.
 
 The source files say why each step is what it is: `src/query-client.ts` for the
