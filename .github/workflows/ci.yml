@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.ref_name == 'main' && github.run_id || 'pr' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # renovate: datasource=github-releases depName=oven-sh/bun extractVersion=^bun-v(?<version>.+)$
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      # The release asset is this tarball, so its file list is checked on every
+      # change: the runtime sources, and no test file.
+      - name: Pack the release tarball
+        run: bun pm pack --destination "$RUNNER_TEMP"
+      - name: Check the tarball's contents
+        run: |
+          tar -tzf "$RUNNER_TEMP"/curlewlabs-com-workers-logs-reader-*.tgz | sort > "$RUNNER_TEMP/packed.txt"
+          cat "$RUNNER_TEMP/packed.txt"
+          grep -qx 'package/src/index.ts' "$RUNNER_TEMP/packed.txt"
+          grep -qx 'package/LICENSE-MIT' "$RUNNER_TEMP/packed.txt"
+          grep -qx 'package/LICENSE-APACHE' "$RUNNER_TEMP/packed.txt"
+          if grep -E '\.test\.ts$|test-fixtures' "$RUNNER_TEMP/packed.txt"; then
+            echo "test files in the tarball" >&2
+            exit 1
+          fi
+
+  baseline:
+    # The checks every Curlew Labs repository runs, in one place:
+    # https://github.com/curlewlabs-com/ci-baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: curlewlabs-com/ci-baseline@f05f17a38ba2dfbaf0cde130a375b346e9a923a2 # v0.2.0
+
+  conclusion:
+    # The one check branch protection requires, so the jobs above can be
+    # renamed or split without editing the protection.
+    needs: [test, baseline]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Require every check job to pass
+        env:
+          TEST: ${{ needs.test.result }}
+          BASELINE: ${{ needs.baseline.result }}
+        run: test "$TEST" = success && test "$BASELINE" = success

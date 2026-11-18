@@ -1,0 +1,32 @@
+{
+  "name": "@curlewlabs-com/workers-logs-reader",
+  "version": "0.1.0",
+  "description": "Read a Cloudflare Workers Observability window to exhaustion from the telemetry query API, and know whether what came back is complete.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/curlewlabs-com/workers-logs-reader.git"
+  },
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "!src/test-fixtures.ts",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test --no-install --timeout 60000 src"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}
