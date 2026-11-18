@@ -1,10 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import {
   type FetchLike,
   queryLogEvents,
   queryLogEventsTuned,
 } from "./query-client";
-import { ABR_LEVEL_UNKNOWN } from "./abr";
+import { ABR_LEVEL_UNKNOWN, samplingFailure } from "./abr";
 import {
   QUERY_URL,
   authOf,
@@ -191,9 +191,11 @@ describe("queryLogEvents", () => {
     expect(timeframeOf(calls[2]!)).toEqual({ from: 2000, to: 2500 });
   });
 
-  // An exact-multiple boundary must not start another chunk at toMs because the
-  // telemetry API rejects that zero-width [toMs, toMs] request.
-  it("does not query a zero-width final chunk at an exact multiple", async () => {
+  // An exact-multiple boundary must not start another chunk at toMs, because the
+  // telemetry API rejects that zero-width [toMs, toMs] request; nor may it drop
+  // toMs, whose events would be lost while the read reports itself complete. The
+  // chunk before reaches toMs instead.
+  it("reaches toMs from the chunk before instead of a zero-width chunk", async () => {
     const { fetchImpl, calls } = recordingFetch((_url, index) =>
       pageResponse([`id-${index}`]),
     );
@@ -207,7 +209,7 @@ describe("queryLogEvents", () => {
     expect(calls.map(timeframeOf)).toEqual([
       { from: 0, to: 999 },
       { from: 1000, to: 1999 },
-      { from: 2000, to: 2999 },
+      { from: 2000, to: 3000 },
     ]);
   });
 
@@ -406,9 +408,11 @@ describe("queryLogEvents", () => {
   });
 
   // A sampled window whose span is an exact multiple of the narrower width must not
-  // recreate the API-invalid point-width tail inside the recursive narrowing rung.
-  it("does not query a zero-width narrowing tail at an exact multiple", async () => {
-    const { fetchImpl, calls } = widthAwareFetch(1000);
+  // recreate the API-invalid point-width tail inside the recursive narrowing rung, and
+  // must not drop the window's last millisecond either: the sampled attempt it replaces
+  // covered it, and the read would report itself complete without its events.
+  it("narrows into windows that keep the endpoint, with no zero-width tail", async () => {
+    const { fetchImpl, calls } = widthAwareFetch(1001);
 
     const { events, maxAbrLevel } = await queryLogEventsTuned(
       configWith(fetchImpl, {
@@ -425,7 +429,7 @@ describe("queryLogEvents", () => {
     expect(calls.map(timeframeOf)).toEqual([
       { from: 0, to: 2000 },
       { from: 0, to: 999 },
-      { from: 1000, to: 1999 },
+      { from: 1000, to: 2000 },
     ]);
   });
 
@@ -769,8 +773,9 @@ describe("queryLogEvents with onPage", () => {
 
   // Narrowing re-reads a sampled window and discards what it read first, which a
   // fold has already counted, so the public call makes onPage a single pass: one
-  // request per page, no retry, no narrowing - and the sampling is still reported.
-  it("reads each page once and still reports sampling", async () => {
+  // request per page, no retry, no narrowing - and the sampling is still reported,
+  // as unresolved: no healing ran, so nothing showed the volume is too large.
+  it("reads each page once and reports its sampling as unresolved", async () => {
     const { fetchImpl, calls } = recordingFetch(() =>
       pageResponse(["id-a"], 7),
     );
@@ -789,6 +794,10 @@ describe("queryLogEvents with onPage", () => {
     expect(calls).toHaveLength(1);
     expect(folded).toHaveLength(1);
     expect(result.maxAbrLevel).toBe(7);
+    expect(result.healBudgetExhausted).toBe(true);
+    expect(
+      samplingFailure(result.maxAbrLevel, result.healBudgetExhausted),
+    ).toMatch(/UNRESOLVED/);
   });
 
   // The guard behind it: the tuned entry point refuses the combination outright.
@@ -812,6 +821,55 @@ describe("queryLogEvents dataset", () => {
     for (const call of calls) {
       const body = JSON.parse(call.init?.body as string);
       expect(body.parameters).toEqual({ datasets: ["otel"] });
+    }
+  });
+});
+
+describe("queryLogEvents at scale and in its logs", () => {
+  // More events than an engine accepts as arguments: spreading them into push()
+  // throws a RangeError and fails a read that succeeded.
+  it("collects a chunk larger than an engine's argument limit", async () => {
+    const pageLimit = 1000;
+    const fullPages = 1000;
+    const page = (count: number): Response =>
+      jsonResponse({
+        success: true,
+        result: {
+          events: {
+            events: Array.from({ length: count }, () => ({
+              $metadata: { id: "id-x" },
+            })),
+          },
+          statistics: { abr_level: 1 },
+        },
+      });
+    const { fetchImpl } = recordingFetch((_url, index) =>
+      page(index < fullPages ? pageLimit : 0),
+    );
+    const { events } = await queryLogEventsTuned(
+      configWith(fetchImpl, { pageLimit, maxPages: fullPages + 1 }),
+    );
+    expect(events).toHaveLength(pageLimit * fullPages);
+  });
+
+  // A failed response's body can echo the query, a needle included, and a retry
+  // warning reaches the caller's log whether or not the caller handles anything.
+  it("names a retried failure by its status, never by its body", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { fetchImpl } = recordingFetch((_url, index) =>
+        index === 0
+          ? new Response("never-log-this-body", { status: 503 })
+          : pageResponse([]),
+      );
+      await queryLogEventsTuned(
+        configWith(fetchImpl, { transientBackoffMs: 1 }),
+      );
+      const logged = warn.mock.calls.flat().join("\n");
+      expect(logged).toMatch(/HTTP 503/);
+      expect(logged).not.toMatch(/never-log-this-body/);
+    } finally {
+      warn.mockRestore();
     }
   });
 });

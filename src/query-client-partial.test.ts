@@ -54,7 +54,7 @@ describe("queryLogEvents partial results", () => {
       expect(failure.partialResult.events).toMatchObject([
         { $metadata: { id: "id-earlier" } },
       ]);
-      expect(failure.failedRange).toEqual({ fromMs: 1000, toMs: 1999 });
+      expect(failure.failedRange).toEqual({ fromMs: 1000, toMs: 2000 });
       expect(failure.failureReason).toMatch(
         new RegExp(`logs query HTTP ${status}`),
       );

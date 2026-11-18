@@ -301,19 +301,28 @@ export class PartialLogsQueryError extends Error {
 // splitting the span into <=1-hour queries (to dodge the query-time adaptive sampling above)
 // and paging each chunk via the cursor until a short page signals exhaustion. Adjacent chunks
 // have no gap or overlap - each ends 1 ms before the next begins. When toMs is exactly the
-// next chunk boundary, traversal stops at the preceding millisecond instead of issuing the
-// API-invalid [toMs, toMs] request. The keyset-cursor + sealed/in-progress reasoning in the
+// next chunk boundary, the chunk before it reaches toMs instead (windowEnd), since the API
+// rejects the point-width [toMs, toMs] request. The keyset-cursor + sealed/in-progress reasoning in the
 // file header holds within each chunk. Each chunk goes through queryWindowNarrowing, so a
 // chunk that comes back sampled is retried and, if still sampled, re-queried at narrower
 // sub-windows before its result folds in here.
 export async function queryLogEvents(
   config: LogsQueryConfig,
 ): Promise<LogsQueryResult> {
-  return queryLogEventsTuned(
-    config.onPage === undefined
-      ? config
-      : { ...config, samplingRetries: 0, narrowWidthsMs: [] },
-  );
+  if (config.onPage === undefined) {
+    return queryLogEventsTuned(config);
+  }
+  const result = await queryLogEventsTuned({
+    ...config,
+    samplingRetries: 0,
+    narrowWidthsMs: [],
+  });
+  // A single pass spends no heal budget at all, so sampling it saw was never
+  // healed: unresolved, which is what the flag tells samplingFailure, and not
+  // the floor-survived verdict a false flag would give.
+  return result.maxAbrLevel > 1
+    ? { ...result, healBudgetExhausted: true }
+    : result;
 }
 
 // queryLogEvents with its internal settings exposed, for the tests.
@@ -339,7 +348,7 @@ export async function queryLogEventsTuned(
     chunkFrom < config.toMs;
     chunkFrom += chunkMs
   ) {
-    const chunkTo = Math.min(chunkFrom + chunkMs - 1, config.toMs);
+    const chunkTo = windowEnd(chunkFrom, chunkMs, config.toMs);
     let chunk: LogsQueryResult;
     try {
       chunk = await queryWindowNarrowing(
@@ -364,7 +373,7 @@ export async function queryLogEventsTuned(
         { cause: error },
       );
     }
-    events.push(...chunk.events);
+    appendAll(events, chunk.events);
     maxAbrLevel = worseAbrLevel(maxAbrLevel, chunk.maxAbrLevel);
     healBudgetExhausted = healBudgetExhausted || chunk.healBudgetExhausted;
     firstChunk = false;
@@ -428,9 +437,9 @@ async function queryWindowNarrowing(
   // monotonic clock has not crossed the deadline) - nothing to carry from the discarded attempt.
   let healBudgetExhausted = false;
   for (let subFrom = fromMs; subFrom < toMs; subFrom += width) {
-    const subTo = Math.min(subFrom + width - 1, toMs);
+    const subTo = windowEnd(subFrom, width, toMs);
     const sub = await queryWindowNarrowing(config, subFrom, subTo, false, rest);
-    events.push(...sub.events);
+    appendAll(events, sub.events);
     maxAbrLevel = worseAbrLevel(maxAbrLevel, sub.maxAbrLevel);
     healBudgetExhausted = healBudgetExhausted || sub.healBudgetExhausted;
   }
@@ -467,7 +476,7 @@ async function queryWindow(
     if (config.onPage !== undefined) {
       config.onPage(parsed.events);
     } else {
-      events.push(...parsed.events);
+      appendAll(events, parsed.events);
     }
     // worseAbrLevel, not Math.max: parsed.abrLevel is ABR_LEVEL_UNKNOWN (-1) on an
     // unreadable page, which must dominate (fail closed), not lose to a numeric level.
@@ -585,11 +594,40 @@ async function fetchPageWithFirstHitRetry(
     if (!isCloudflareFirstHitFlake(err)) {
       throw err;
     }
-    const message = err instanceof Error ? err.message : String(err);
     console.warn(
-      `[workers-logs-reader] query first-hit Cloudflare flake - retrying once: ${message}`,
+      `[workers-logs-reader] query first-hit Cloudflare flake - retrying once: ${failureClass(err)}`,
     );
     return await fetchPage(config, fromMs, toMs, pageLimit, cursor);
+  }
+}
+
+// What a retried failure was, for the warning: its HTTP status or its kind, never its
+// message. A failed response's body, which the thrown error carries in full, can echo
+// the query and its needle, and a warning goes to the caller's log whether or not the
+// caller ever handles the error.
+function failureClass(err: unknown): string {
+  if (err instanceof LogsQueryHttpError) {
+    return `HTTP ${err.status}`;
+  }
+  if (err instanceof LogsQueryTransportError) {
+    return "no response, or a body that could not be read";
+  }
+  return err instanceof Error ? err.name : "unknown failure";
+}
+
+// The inclusive end of the window starting at `from` that is `width` ms wide and stops at
+// `to`. When the window after it would hold only `to` itself, this one reaches `to`
+// instead: the API rejects a point-width window, and a window left out is events lost.
+function windowEnd(from: number, width: number, to: number): number {
+  const end = Math.min(from + width - 1, to);
+  return end + 1 === to ? to : end;
+}
+
+// Appended one at a time: spreading a chunk's events into push() passes each as an
+// argument, and an hour can hold more events than an engine accepts arguments.
+function appendAll(into: unknown[], from: readonly unknown[]): void {
+  for (const event of from) {
+    into.push(event);
   }
 }
 
@@ -636,10 +674,9 @@ async function fetchPage(
         throw err;
       }
       const delayMs = backoffMs * 2 ** attempt;
-      const reason = err instanceof Error ? err.message : String(err);
       console.warn(
         `[workers-logs-reader] query transient failure on window [${fromMs}..${toMs}] - ` +
-          `retry ${attempt + 1}/${retries} after ${delayMs}ms backoff: ${reason}`,
+          `retry ${attempt + 1}/${retries} after ${delayMs}ms backoff: ${failureClass(err)}`,
       );
       await config.sleep(delayMs);
     }

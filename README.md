@@ -110,14 +110,14 @@ accepted permission for the endpoint. The token goes only to
 
 `queryLogEvents` takes, besides the window:
 
-| Option                  | Why it exists                                                                                                                                                                                                                                                                                                         |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `accountId`, `apiToken` | Every call names the account and carries a token.                                                                                                                                                                                                                                                                     |
-| `fetchImpl`, `sleep`    | The package makes no call and waits on no timer of its own: it runs wherever you can hand it a `fetch`, and tests run without the network.                                                                                                                                                                            |
-| `now`, `healDeadlineMs` | Healing a heavily sampled day can take many minutes. Past the deadline the read stops healing and returns what it has, marked incomplete; every chunk still gets its one pass, so no events are dropped for time. Set it inside whatever time limit you run within.                                                   |
-| `needle` (optional)     | The API's own full-text match, for one request's or one identity's events out of a short window. Unset, every event is read.                                                                                                                                                                                          |
-| `dataset` (optional)    | The dataset to read: the Workers log events by default, or another the API holds, such as trace spans.                                                                                                                                                                                                                |
-| `onPage` (optional)     | For a caller that only folds the events, summing sizes or counting: each page goes to the callback and is not kept. The read is then a single pass, one request per page with no retry of a sampled page and no narrowing, so it costs one read of the window; `maxAbrLevel` still says whether any page was sampled. |
+| Option                  | Why it exists                                                                                                                                                                                                                                                                                                                                                    |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accountId`, `apiToken` | Every call names the account and carries a token.                                                                                                                                                                                                                                                                                                                |
+| `fetchImpl`, `sleep`    | The package makes no call and waits on no timer of its own: it runs wherever you can hand it a `fetch`, and tests run without the network.                                                                                                                                                                                                                       |
+| `now`, `healDeadlineMs` | Healing a heavily sampled day can take many minutes. Past the deadline the read stops healing and returns what it has, marked incomplete; every chunk still gets its one pass, so no events are dropped for time. Set it inside whatever time limit you run within.                                                                                              |
+| `needle` (optional)     | The API's own full-text match, for one request's or one identity's events out of a short window. Unset, every event is read.                                                                                                                                                                                                                                     |
+| `dataset` (optional)    | The dataset to read: the Workers log events by default, or another the API holds, such as trace spans.                                                                                                                                                                                                                                                           |
+| `onPage` (optional)     | For a caller that only folds the events, summing sizes or counting: each page goes to the callback and is not kept. The read is then a single pass, one request per page with no retry of a sampled page and no narrowing, so it costs one read of the window; `maxAbrLevel` still says whether any page was sampled, and a sampled read is reported unresolved. |
 
 The chunk width, page size, retry counts, backoffs and narrowing widths are
 fixed; the comments in `src/query-client.ts` say why each is what it is.
@@ -128,10 +128,11 @@ fixed; the comments in `src/query-client.ts` say why each is what it is.
   chunks in time order).
 - `maxAbrLevel`: 1 if every page came back at full resolution; above 1 if any
   stayed sampled; `ABR_LEVEL_UNKNOWN` (-1) if any page had no usable level.
-- `healBudgetExhausted`: whether the deadline cut healing short. A sampled read
-  with this set is unresolved, and reading again may come back complete. One
-  without it stayed sampled down to 1-minute windows: the volume is more than a
-  query can read at full resolution, and Logpush is the way forward.
+- `healBudgetExhausted`: whether healing was cut short, by the deadline or, with
+  `onPage`, by not running at all. A sampled read with this set is unresolved,
+  and reading again may come back complete. One without it stayed sampled down
+  to 1-minute windows: the volume is more than a query can read at full
+  resolution, and Logpush is the way forward.
 
 A chunk that fails after earlier chunks succeeded throws
 `PartialLogsQueryError`, which carries the events already read and the range
@@ -163,7 +164,13 @@ read, `src/abr.ts` for the sampling verdict.
 
 ## Known issues
 
-None known.
+- **The heal deadline is checked before each wait, not before each request.** A
+  retry whose wait began before the deadline still sends its request after it,
+  the first-call authentication retry does not look at the deadline, and once a
+  chunk starts narrowing, each of its narrower windows still gets its first read
+  after the deadline passes. A read can therefore run past `healDeadlineMs` by
+  one retry's request, or by the rest of one chunk's narrower reads; leave that
+  much room under your own limit.
 
 ## License
 

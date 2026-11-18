@@ -17,6 +17,8 @@ release lines have no promised backport window.
 The package makes no call of its own: every request goes through the `fetch` you
 pass in, to `api.cloudflare.com`, with the token you pass in as a bearer header.
 It never logs the token. Its warnings name time windows, sampling levels and
-HTTP statuses; an error from the API is passed on with the response body text
-Cloudflare sent, which can echo part of the query. The events it returns are
-your Workers' logs, and whatever personal data they carry is yours to handle.
+HTTP statuses, never a response body. An error it throws carries the response
+body text Cloudflare sent, which can echo part of the query, a needle included,
+so treat a thrown error's message as you would the query. The events it returns
+are your Workers' logs, and whatever personal data they carry is yours to
+handle.
