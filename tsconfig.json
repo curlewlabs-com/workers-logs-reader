@@ -1,0 +1,30 @@
+{
+  // The sources run wherever a caller hands them a fetch, and the tests run under
+  // Bun. Bun's types carry the web globals the sources use (Response, RequestInit)
+  // as well as bun:test, so one program covers the sources and the tests without
+  // a dependency on any runtime's own type package.
+  //
+  // rootDir is the package boundary. tsc refuses any source file the program
+  // reaches outside src/ (TS6059), so an import from an app, by relative path
+  // or through a package link, fails the typecheck.
+  //
+  // The opt-in strictness flags are on so an app with the same flags can
+  // typecheck these sources as part of its own program, since the package
+  // ships TypeScript source.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "rootDir": "src",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}
