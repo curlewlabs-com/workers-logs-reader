@@ -185,8 +185,7 @@ Licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-at your option. Releases published under the MIT license alone may also be used
-under either license.
+at your option.
 
 ### Contribution
 

@@ -714,7 +714,9 @@ async function fetchPageOnce(
   // cron/Durable Object events. `config.needle` is the one narrowing the API
   // applies, and only a caller asking a narrower question sets it.
   const body: Record<string, unknown> = {
-    queryId: "request-log-archive",
+    // A label only: with `parameters` given inline, the API runs the query as
+    // sent and does not look the id up.
+    queryId: "workers-logs-reader",
     view: "events",
     limit: pageLimit,
     // The per-chunk sub-window, not the full day - a narrow window is what holds the
