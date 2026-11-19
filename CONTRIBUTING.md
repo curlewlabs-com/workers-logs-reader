@@ -15,6 +15,10 @@ bun run typecheck
 bun run test
 ```
 
+eslint runs in CI through ci-baseline. To run the same check locally, after
+installing dependencies: `<a ci-baseline checkout>/lib/lint-local.sh`. It runs
+the ci-baseline commit this repository's workflows pin.
+
 The tests need no Cloudflare account: every request goes through an injected
 `fetch`, and the fixtures in `src/test-fixtures.ts` are invented. A report of a
 response the package misreads is most useful with the response's shape and any

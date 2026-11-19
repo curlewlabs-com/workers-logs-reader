@@ -112,7 +112,7 @@ export function widthAwareFetch(fullResAtOrBelowMs: number): {
   const fetchImpl: FetchLike = (input, init) => {
     const url = input;
     calls.push({ url, init: init as RequestInit | undefined });
-    const body = JSON.parse((init?.body as string) ?? "{}") as {
+    const body = JSON.parse((init?.body as string | undefined) ?? "{}") as {
       timeframe?: { from?: number; to?: number };
     };
     const from = body.timeframe?.from ?? 0;
