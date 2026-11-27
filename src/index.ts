@@ -10,6 +10,7 @@ export {
 export {
   PartialLogsQueryError,
   queryLogEvents,
+  type LogsFilter,
   type LogsQueryConfig,
   type LogsQueryResult,
 } from "./query-client";
