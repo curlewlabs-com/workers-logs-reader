@@ -5,9 +5,9 @@
 // completed without letting an incomplete read look successful.
 //
 // The guarantees below are stated for reading a whole UTC day of every Worker in
-// an account, which is what the client is sized for. `needle` and `dataset`
-// narrow what the API returns; they change which events a window admits, not how
-// the window is paged.
+// an account, which is what the client is sized for. `needle`, `filters` and
+// `dataset` narrow what the API returns; they change which events a window admits,
+// not how the window is paged.
 //
 // Why paging is safe against the classic paginate-while-writing miss/duplicate bug:
 //   1. Keyset, not numeric offset - holds for ANY window, sealed or in-progress.
@@ -122,6 +122,11 @@ export interface LogsQueryConfig {
   // reasoning in the file header, which is about WHERE the cursor points, not about
   // which events the window admits.
   needle?: string;
+  // Fields every event read must match, all of them (the API's "and"), beside any
+  // needle - one Worker's events, or one deployed version's. Unset or empty reads
+  // every event. Like the needle, they change which events the window admits, not
+  // how it is paged or healed.
+  filters?: readonly LogsFilter[];
   // The dataset to page: the Workers log dataset by default, or another the API
   // holds, such as the trace spans. Nothing else about the query changes with it.
   dataset?: string;
@@ -133,6 +138,14 @@ export interface LogsQueryConfig {
   // a measurement costs one read of the window. maxAbrLevel still says whether any
   // page was sampled.
   onPage?: (events: readonly unknown[]) => void;
+}
+
+// One field an event must match: the event's `key` field, a string, equal to
+// `value`. Keys are the API's field paths, such as `$metadata.service` or
+// `$workers.scriptVersion.id`.
+export interface LogsFilter {
+  key: string;
+  value: string;
 }
 
 // The read's internal settings, each with the default below. Tests set them to
@@ -777,12 +790,14 @@ async function fetchPageOnce(
     `/workers/observability/telemetry/query`;
   // `parameters.datasets` is required for an ad-hoc query - without it the API
   // tries to resolve `queryId` as a saved query and returns "Query not found".
-  // The query is account-wide and window-scoped only (timeframe + dataset, NO
-  // filters): every Worker's events in the window come in one stream, which
-  // events.ts partitionEventsByService can split afterward. No service or
-  // invocation-type filter - either would silently drop whole Workers or drop the
-  // cron/Durable Object events. `config.needle` is the one narrowing the API
-  // applies, and only a caller asking a narrower question sets it.
+  // Unnarrowed, the query is account-wide and window-scoped only (timeframe +
+  // dataset): every Worker's events in the window come in one stream, which
+  // events.ts partitionEventsByService can split afterward. The client adds no
+  // service or invocation-type filter of its own - either would silently drop
+  // whole Workers or the cron/Durable Object events. `config.needle` and
+  // `config.filters` are the narrowing the API applies, and only a caller asking a
+  // narrower question sets them.
+  const filters = config.filters ?? [];
   const body: Record<string, unknown> = {
     // A label only: with `parameters` given inline, the API runs the query as
     // sent and does not look the id up.
@@ -796,6 +811,17 @@ async function fetchPageOnce(
       datasets: [config.dataset ?? DATASET],
       ...(config.needle !== undefined
         ? { needle: { value: config.needle, isRegex: false, matchCase: true } }
+        : {}),
+      ...(filters.length > 0
+        ? {
+            filterCombination: "and",
+            filters: filters.map(({ key, value }) => ({
+              key,
+              operation: "eq",
+              type: "string",
+              value,
+            })),
+          }
         : {}),
     },
   };

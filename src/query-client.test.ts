@@ -63,10 +63,11 @@ describe("queryLogEvents", () => {
     expect(body1.offsetDirection).toBe("next");
   });
 
-  // The needle is the only narrowing the client will emit, and it rides every page
-  // of the window rather than just the first - a cursor page that dropped it would
-  // widen mid-traversal and return a different population than page 0, which is the
-  // failure a caller filtering on one identity could not see in its own output.
+  // A needle rides every page of the window rather than just the first - a cursor
+  // page that dropped it would widen mid-traversal and return a different
+  // population than page 0, which is the failure a caller filtering on one identity
+  // could not see in its own output. query-client-filters.test.ts holds the same
+  // for field filters.
   it("carries a configured needle on every page of the window", async () => {
     const { fetchImpl, calls } = recordingFetch((_url, index) =>
       index === 0 ? pageResponse(["id-a", "id-b"]) : pageResponse(["id-c"]),
